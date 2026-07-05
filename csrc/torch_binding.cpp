@@ -807,15 +807,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
 
-    // Inplace fused {alltoall + cross-cp LSE-weighted attn update + head-AllGather}.
-    // attn is input & output (Tensor! inplace marking); lse is a pure input (no
-    // lse output — downstream does not consume it, only Phase B weighting reads it).
-    // Returns attn ref (mirrors dispatch_ffn_combine) for Dynamo functionalization
-    // + npugraph_ex graph capture. mask_num is a 0-d int32 device tensor
-    // (per-rank active token count).
+    // Out-variant fused {alltoall + cross-cp LSE-weighted attn update + head-AllGather}.
+    // Aligned with dispatch_ffn_combine: attn is const input, attn_out is mutable output
+    // (Tensor! marking on output only). Inplace memory semantics maintained at kernel level
+    // via OpDef SetRef (attn_in == attn_out). Caller passes same tensor for attn & attn_out.
+    // PyTorch Autograd fallback requires non-mutable input for cudagraph capture
+    // compatibility. mask_num is a 0-d int32 device tensor (per-rank active token count).
     ops.def(
-        "npu_allto_all_attn_update_all_gather(Tensor! attn, Tensor lse, Tensor mask_num,"
-        "                                    str group, int group_size) -> (Tensor attn)"
+        "npu_allto_all_attn_update_all_gather(Tensor attn, Tensor lse, Tensor mask_num,"
+        "                                    str group, int group_size, Tensor! attn_out) -> (Tensor attn_out)"
     );
     ops.impl("npu_allto_all_attn_update_all_gather", torch::kPrivateUse1,
              &vllm_ascend::npu_allto_all_attn_update_all_gather);

@@ -192,17 +192,18 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
-// Inplace: attn shape unchanged (kernel only rearranges rows + LSE-weighted
-// reduce + head-AllGather). lse is a pure input (no lse output — dropped after
-// Phase B weighting). Returns attn ref only, matching torch_binding.cpp schema.
+// Out-variant Meta (aligned with dispatch_ffn_combine_meta): attn is const input,
+// attn_out is mutable output. Shape unchanged — kernel only rearranges rows +
+// LSE-weighted reduce + head-AllGather within same [T·cp, n/cp·D] footprint.
 at::Tensor& npu_allto_all_attn_update_all_gather_meta(
-    at::Tensor& attn,
+    const at::Tensor& attn,
     const at::Tensor& lse,
     const at::Tensor& mask_num,
     c10::string_view group,
-    int64_t group_size
+    int64_t group_size,
+    at::Tensor& attn_out
 ) {
-    return attn;
+    return attn_out;
 }
 
 at::Tensor npu_lightning_indexer_meta(

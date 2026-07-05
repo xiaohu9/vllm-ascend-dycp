@@ -187,14 +187,12 @@ aclnnStatus aclnnAlltoAllAttnUpdateAllGatherGetWorkspaceSize(
 
     OP_LOGD("AlltoAllAttnUpdateAllGather inplace, attn %s, lse %s, group_size=%ld",
             attn->ToString().GetString(), lse->ToString().GetString(), group_size);
-
     // Inplace via OpDef SetRef: pass attn ONCE (lse is a pure input, no SetRef).
     // Framework binds Output("attn_ref") slot to Input("attn_ref") same address.
     aclnnStatus ret = aclnnInnerAlltoAllAttnUpdateAllGatherGetWorkspaceSize(
         attn, lse, mask_num, group, group_size,
         workspaceSize, executor);
     OP_LOGD("AlltoAllAttnUpdateAllGather, aclnnInnerGetWorkspaceSize ret = %d.", ret);
-
     static NnopbaseDfxId dfxId = {0x60003, __func__, false};
     NnopbaseReportApiInfo(timeStamp, dfxId);
     return ret;

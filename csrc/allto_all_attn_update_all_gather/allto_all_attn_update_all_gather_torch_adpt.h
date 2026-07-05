@@ -16,21 +16,26 @@
 #ifndef ALLTO_ALL_ATTN_UPDATE_ALL_GATHER_TORCH_ADPT_H
 #define ALLTO_ALL_ATTN_UPDATE_ALL_GATHER_TORCH_ADPT_H
 
-#include <tuple>
-
 namespace vllm_ascend {
 
 at::Tensor& npu_allto_all_attn_update_all_gather(
-    at::Tensor &attn,
-    const at::Tensor &lse,
-    const at::Tensor &mask_num,
+    const at::Tensor& attn,
+    const at::Tensor& lse,
+    const at::Tensor& mask_num,
     c10::string_view group,
-    int64_t group_size)
+    int64_t group_size,
+    at::Tensor& attn_out)
 {
-    // Inplace operator: attn is both input and output; lse is a pure input
-    // (read for Phase B weighting, no lse output — downstream does not consume it).
-    // Returns attn ref (mirrors dispatch_ffn_combine) so the inplace output is
-    // bound for Dynamo functionalization + npugraph_ex graph capture.
+    // Out-variant (aligned with dispatch_ffn_combine): attn is const input,
+    // attn_out is mutable output. Inplace memory at kernel level via OpDef SetRef
+    // (attn_in == attn_out). Caller MUST pass same tensor for attn & attn_out
+    // — ACLNN only receives attn; SetRef binds output slot to attn's address.
+    // PyTorch Autograd fallback requires non-mutable input for cudagraph capture
+    // compatibility — see VariableFallbackKernel.cpp is_mutable_output guard.
+    TORCH_CHECK(attn.data_ptr() == attn_out.data_ptr(),
+                "npu_allto_all_attn_update_all_gather: attn and attn_out must share "
+                "the same storage (inplace via SetRef). Got attn=", attn.data_ptr(),
+                " attn_out=", attn_out.data_ptr());
     std::string group_str(group);
     char *group_ptr = group_str.data();
 
@@ -38,7 +43,7 @@ at::Tensor& npu_allto_all_attn_update_all_gather(
         attn, lse, mask_num,
         group_ptr, group_size);
 
-    return attn;
+    return attn_out;
 }
 
 }

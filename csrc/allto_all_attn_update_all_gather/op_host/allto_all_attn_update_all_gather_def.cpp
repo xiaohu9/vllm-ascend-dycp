@@ -3,21 +3,24 @@
  *
  * AlltoAllAttnUpdateAllGather OpDef Registration
  *
- * Fused {AlltoAll + LSE-weighted attention update + head AllGather}, in-place on
- * attn along the CP (context parallel) communication group.
+ * Fused {AlltoAll + LSE-weighted attention update + head AllGather}, non-inplace
+ * on attn along the CP (context parallel) communication group.
  *
- *   attn_ref [totalT, n_per_cp · D] bf16   (Input & Output, same GM address)
- *   lse     [totalT, n_per_cp]     fp32   (Input only — read for Phase B weighting,
+ *   attn_in  [totalT, n_per_cp · D] bf16   (Input only - read for Phase A pack
+ *                                          + inactive rows copy source)
+ *   lse      [totalT, n_per_cp]     fp32   (Input only - read for Phase B weighting,
  *                                         no output: downstream does not consume it)
  *   mask_num []                     int32  (mask_per_rank; b0_total = mask_per_rank · cp_size)
+ *   attn_out [totalT, n_per_cp · D] bf16   (Output - independent GM, written by
+ *                                          Phase C active rows + inactive copy)
  *
- * Active rows [0, b0_total): Phase A peermem-pack → Phase B LSE-weighted reduce
- * → Phase C peermem head-AllGather (reverse stride) back to attn.
- * Inactive rows [b0_total, totalT): inplace pass-through (kernel does not touch;
- * opbuild SetRef guarantees input/output share GM address).
+ * Active rows [0, b0_total): Phase A peermem-pack -> Phase B LSE-weighted reduce
+ * -> Phase C peermem head-AllGather (reverse stride) write to attn_out.
+ * Inactive rows [b0_total, totalT): explicit copy attn_in -> attn_out (non-inplace,
+ * no SetRef - output is an independent GM buffer, 对齐 dispatch_ffn_combine).
  *
- * Inplace contract: Input("attn_ref") + Output("attn_ref") same-name + _ref
- * suffix → opbuild emits NnopbaseSetRef. lse has no Output (pure input, no SetRef).
+ * 非 inplace contract: Input("attn_in") + Output("attn_out") 不同名 -> opbuild
+ * 不 emit NnopbaseSetRef. lse has no Output (pure input, no SetRef).
  */
 
 #include "register/op_def_registry.h"
@@ -28,9 +31,9 @@ class AlltoAllAttnUpdateAllGather : public OpDef {
 public:
     explicit AlltoAllAttnUpdateAllGather(const char *name) : OpDef(name) {
         // ===== Inputs =====
-        // attn_ref: 同名 Input + Output + _ref 后缀 = inplace SetRef gate
-        // lse:      纯 input (无 Output, 无 SetRef) — 仅 Phase B 加权读取
-        this->Input("attn_ref")
+        // attn_in: 纯 input (只读) - Phase A 读 active rows + inactive rows 搬运源
+        // lse:     纯 input (无 Output, 无 SetRef) - 仅 Phase B 加权读取
+        this->Input("attn_in")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})
             .Format({ge::FORMAT_ND})
@@ -46,8 +49,8 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // ===== Outputs (inplace: attn_ref same name as Input, _ref suffix) =====
-        this->Output("attn_ref")
+        // ===== Outputs (非 inplace: attn_out 不同名, 无 SetRef) =====
+        this->Output("attn_out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})
             .Format({ge::FORMAT_ND})

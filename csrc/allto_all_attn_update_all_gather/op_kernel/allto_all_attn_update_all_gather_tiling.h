@@ -46,6 +46,7 @@ public:
     uint64_t slotCBytesPerRank;        // = slotCRowsMax · attnRowSize   (pure attn, lse_out dropped)
     uint64_t slotAOffsetInWin;         // = 0
     uint64_t slotCOffsetInWin;         // = groupSize · slotABytesPerRank
+    uint64_t flagOffset;               // 动态 flag 区起始字节偏移 = AlignUp32(dataWinBytes), 贴数据区尾
 
     // ===== Tile control (Phase A/C UB ping-pong) =====
     uint32_t maxRowsPerSubtile;        // single ping-pong half row 上界

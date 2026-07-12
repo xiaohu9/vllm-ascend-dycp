@@ -244,6 +244,22 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
             (unsigned long)tilingData->slotCBytesPerRank),
         return ge::GRAPH_FAILED);
 
+    // ---------- 4.1 Flag region (dynamic, tail of data area) ----------
+    // 对齐 matmul_reduce_scatter_v2 生产范式: flag 区贴数据区尾, 32B 对齐,
+    // 不再硬编 100MB/180MB (避免落到 slotA/slotC 数据区中段被覆盖, Bug #1).
+    // 3 flags per rank (Phase A/B/C cross-rank sync), FLAG_OFFSET 以字节计.
+    uint64_t dataWinBytes = static_cast<uint64_t>(neededWinBytes);
+    uint64_t flagOffset = (dataWinBytes + 31) / 32 * 32;        // AlignUp32
+    uint64_t flagRegionBytes = static_cast<uint64_t>(groupSize) * 3 * sizeof(int32_t);
+    OP_TILING_CHECK(flagOffset + flagRegionBytes > maxWinBytes,
+        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
+            "flag region overflows window: flagOff %lu + flagReg %lu > max %lu "
+            "(cp=%u totalT=%u). Increase HCCL_BUFFSIZE or reduce D/totalT.",
+            (unsigned long)flagOffset, (unsigned long)flagRegionBytes, maxWinBytes,
+            groupSize, totalT),
+        return ge::GRAPH_FAILED);
+    tilingData->flagOffset = flagOffset;
+
     // ---------- 5. HCCL window allocation (no collective is ever issued) ----------
     // commtype = ALLTOALLV(8); A3 拓扑(910_93) HCCL 内部按 group 自动识别,
     // algConfig 字符串与邻居 dispatch_ffn_combine 同款.

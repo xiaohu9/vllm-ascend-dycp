@@ -196,13 +196,14 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
 // reduce + head-AllGather). lse is a pure input (no lse output — dropped after
 // Phase B weighting). Returns attn ref only, matching torch_binding.cpp schema.
 at::Tensor& npu_allto_all_attn_update_all_gather_meta(
-    at::Tensor& attn,
+    const at::Tensor& attn_in,
     const at::Tensor& lse,
     const at::Tensor& mask_num,
     c10::string_view group,
-    int64_t group_size
+    int64_t group_size,
+    at::Tensor& attn_out
 ) {
-    return attn;
+    return attn_out;
 }
 
 at::Tensor npu_lightning_indexer_meta(

@@ -41,9 +41,16 @@ namespace AlltoAllAttnUpdateAllGather {
 using namespace AscendC;
 
 // -- Static knobs --
-constexpr int32_t  FLAG_OFFSET           = 100 * 1024 * 1024;
 constexpr uint32_t USED_UB_SIZE          = 160 * 1024;        // fused row ping-pong total
 constexpr uint32_t USED_UB_HALF          = USED_UB_SIZE / 2;
+
+// -- Peermem sync (生产级, 对齐 matmul_reduce_scatter_v2 + distribute_barrier) --
+// flag 区起始偏移 flagOffset_ 改从 tiling 动态读取 (贴数据区尾), 不再硬编 100MB (Bug #1:
+// 旧硬编 100MB 可能落到 slotA/slotC 数据区中段被 Phase A/C 数据写覆盖).
+constexpr int32_t  FLAG_VALUE            = 1;                  // SetBuffFlagByAdd 单次累加值
+constexpr int32_t  RAND_BASE             = 3;                  // reset 基线: reset 写 RAND_BASE, set AtomicAdd 累加, check 等值 flag+RAND_BASE (防跨 launch stale)
+constexpr uint64_t CYCLES_PER_US         = 50UL;               // GetSystemCycle 计数器频率 (对齐 distribute_barrier.h:43)
+constexpr uint64_t SYNC_TIMEOUT_US       = 10ULL * 1000ULL * 1000ULL;  // 10s 死锁护栏 (flag 正常 <1ms, 超时即 assert)
 
 // Phase B numeric helpers
 constexpr uint32_t NUM7           = 7;
@@ -56,13 +63,16 @@ constexpr uint32_t PHASE_B_LANE_BLOCK = NUM8;             // Phase B attn merge 
 // LSE +Inf replacement constants
 static constexpr float POS_INF = std::numeric_limits<float>::infinity();
 static constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
+// M4/M6 -inf 守卫常量：全 -inf token (padding/残留) 时防 exp(-inf-(-inf))=nan 级联
+static constexpr float NEG_FLT_MAX = std::numeric_limits<float>::lowest();   // -3.4e38 (M4-guard: lseM -inf -> -FLT_MAX)
+static constexpr float FLT_MIN_VAL = std::numeric_limits<float>::min();      // 1.17e-38 (M6-guard: lseSum 0 -> FLT_MIN)
 
 // Event IDs ∈ [0,3] per HardEvent channel (HW limit).
 constexpr int32_t EV_PP_A    = 0;   // ping-pong slot 0  (MTE3_MTE2 / MTE2_MTE3)
-constexpr int32_t EV_PP_B    = 1;   // ping-pong slot 1; EV_FLAG_R reuses MTE3_MTE2 slot 1
-constexpr int32_t EV_FLAG_W  = 2;   // S_MTE3
-constexpr int32_t EV_FLAG_R  = 1;   // MTE3_MTE2 (reuses EV_PP_B id; non-overlapping)
-constexpr int32_t EV_FLAG_S  = 3;   // MTE2_S
+constexpr int32_t EV_PP_B    = 1;   // ping-pong slot 1
+constexpr int32_t EV_FLAG_W  = 2;   // S_MTE3      (flag write)
+constexpr int32_t EV_FLAG_R  = 2;   // MTE3_MTE2   (flag read; 独立 slot, 不复用 EV_PP_B - 消除依赖 PipeBarrier 的脆弱复用)
+constexpr int32_t EV_FLAG_S  = 3;   // MTE2_S      (flag readback MTE2->S)
 // Phase B per-token serial sync events (no overlap with A/C ping-pong; separated by SyncAll)
 constexpr int32_t EV_B_MTE2_V = 0;  // MTE2 (load slotA) → V (cast/reduce)
 constexpr int32_t EV_B_V_MTE3 = 0;  // V (final cast)    → MTE3 (write slotC)
@@ -99,19 +109,20 @@ public:
         slotCBytesPerRank_   = tiling->slotCBytesPerRank;
         slotAOffsetInWin_    = tiling->slotAOffsetInWin;     // = 0
         slotCOffsetInWin_    = tiling->slotCOffsetInWin;     // = cp_size_ · slotABytesPerRank_
+        flagOffset_          = tiling->flagOffset;           // 动态 flag 区起始 (贴数据区尾)
         slotCRowsMax_        = tiling->slotCRowsMax;         // = totalT / cp_size_
         maxRowsPerSubtile_   = tiling->maxRowsPerSubtile;
 
         blockIdx_ = GetBlockIdx();
         // Default launcher → blockIdx_ ∈ [0, aivNum_). SplitCoreCal divides work.
 
-        // Inplace contract: attn_in == attn_out (SetRef-guaranteed). lse is now a
+        // 非 inplace: attn_in (read) 和 attn_out (write) 独立 GM (无 SetRef). lse is a
         // pure input (no SetRef) — Phase B still reads it for weighting, but no
         // lse output is written (lse_out dropped: downstream does not consume it).
         attnInGm_   = reinterpret_cast<__gm__ bfloat16_t*>(attnIn);
         lseInGm_    = reinterpret_cast<__gm__ float*>(lseIn);
         maskNumGm_  = reinterpret_cast<__gm__ int32_t*>(maskNum);
-        attnOutGm_  = reinterpret_cast<__gm__ bfloat16_t*>(attnOut);   // == attnInGm_
+        attnOutGm_  = reinterpret_cast<__gm__ bfloat16_t*>(attnOut);   // != attnInGm_ (非 inplace)
 
         // Peermem window addresses — populated for all peers (cp_size_ ≤ 32 → buff_[32] enough).
         winContext_ = (__gm__ HcclOpResParam *)contextGM;
@@ -132,12 +143,17 @@ public:
         // mask_num is 0-d device tensor; read at kernel runtime (aclgraph-safe).
         ReadMaskNum();
         b0_ = b0_raw_ * cp_size_;            // per-rank → total active rows
+        // 生产级 fail-fast: mask_num*cp > totalT 是非法配置 (Phase A 越界写 slotA/user GM,
+        // 越界读随机 lse → 比特模式被解释为 -inf/nan 级联). 不 clamp (静默截断会掩盖 bug),
+        // 直接 assert. host 侧 common_cp.py 同步 raise 拦截 capture/eager, 此处拦 replay.
+        assert(b0_ <= totalT_);
 
         ComputeTileParams();
 
         // Reset peermem flag area (3 flags reserved for 3 cross-rank syncs across A/B/C).
         // Only blockIdx_ == 0 writes; others wait via SyncAll.
         ResetIpcFlags(3);
+        SyncAll<true>();   // 保证所有 core 的 flag 区 reset 完成 (基线 RAND_BASE 就绪) 才进 Process
     }
 
     __aicore__ inline void Process()
@@ -148,8 +164,10 @@ public:
         SplitCoreCalForToken();
 
         if (b0_ == 0) {
-            // No active token: kernel writes nothing. Cross every barrier so launcher-wide
-            // SyncAll gathers. 6 SyncAll covers A/B/C three sync rounds.
+            // No active token: 非 inplace 下需搬运全部 rows [0, totalT) attn_in -> attn_out
+            // (inplace 下靠 SetRef pass-through; 非 inplace 下显式搬运).
+            CopyInactiveRows();   // b0_=0 -> inactive=[0, totalT), 搬全部
+            PipeBarrier<PIPE_ALL>();
             SyncAll<true>(); SyncAll<true>();
             SyncAll<true>(); SyncAll<true>();
             SyncAll<true>(); SyncAll<true>();
@@ -179,6 +197,12 @@ public:
         SyncAll<true>();                       // C barrier #1
         CrossRankSyncV1(2, 1);
         SyncAll<true>();                       // C barrier #2
+
+        // 非 inplace: 搬运 inactive rows [b0_total, totalT) attn_in -> attn_out
+        // (inplace 下靠 SetRef pass-through; 非 inplace 下显式搬运, 规避脏数据).
+        CopyInactiveRows();
+        PipeBarrier<PIPE_ALL>();
+        SyncAll<true>();                       // inactive barrier
     }
 
 private:
@@ -442,6 +466,17 @@ private:
             PipeBarrier<PIPE_V>();
         }
 
+        // ===== M4-guard: 全 -inf token (padding/残留) 时 lseM=-inf 会使 M5 exp(-inf-(-inf))=nan =====
+        // 替成 -FLT_MAX：lse(-inf) - (-FLT_MAX) = -inf，exp(-inf)=0，该 token 贡献归零不 nan。
+        // 复用 ubNegInf/ubMaskU8 (M3 已完成，此处重新装载；不增加 UB 占用)。
+        CompareScalar(ubMaskU8, ubLseM, NEG_INF, CMPMODE::EQ, kPad);
+        PipeBarrier<PIPE_V>();
+        Duplicate<float>(ubNegInf, NEG_FLT_MAX, static_cast<int32_t>(kPad));
+        PipeBarrier<PIPE_V>();
+        Select<float, uint8_t>(ubLseM, ubMaskU8, ubNegInf, ubLseM,
+            SELMODE::VSEL_TENSOR_TENSOR_MODE, kPad);
+        PipeBarrier<PIPE_V>();
+
         // ===== M5: lseExp = lse - lseM, then exp =====
         for (int32_t i = 0; i < cp; i++) {
             Sub(ubLseExp[i * kPad], ubLseFp32[i * kPad], ubLseM, kPad);
@@ -457,6 +492,15 @@ private:
             Add(ubLseSum, ubLseSum, ubLseExp[i * kPad], kPad);
             PipeBarrier<PIPE_V>();
         }
+        // ===== M6-guard: 全 -inf token 时 lseSum=0，log(0)=-inf 会使 lseOut=-inf，
+        //                   M7 exp(-inf-(-inf))=nan。替成 FLT_MIN：log(FLT_MIN) 有限。 =====
+        CompareScalar(ubMaskU8, ubLseSum, 0.0f, CMPMODE::EQ, kPad);
+        PipeBarrier<PIPE_V>();
+        Duplicate<float>(ubNegInf, FLT_MIN_VAL, static_cast<int32_t>(kPad));
+        PipeBarrier<PIPE_V>();
+        Select<float, uint8_t>(ubLseSum, ubMaskU8, ubNegInf, ubLseSum,
+            SELMODE::VSEL_TENSOR_TENSOR_MODE, kPad);
+        PipeBarrier<PIPE_V>();
         Log(ubLseSum, ubLseSum, kPad);
         PipeBarrier<PIPE_V>();
         Add(ubLseOut, ubLseM, ubLseSum, kPad);
@@ -593,7 +637,7 @@ private:
     //  拉走 srcRank 算好的 b0_raw_ 行纯 attn (lse_out dropped, slotC row = attnRowSize_),
     //  按 row=t·cp+srcRank 散到本 rank attnOutGm_。srcRank == rankId_ 已由 PhaseB 直写最终输出,这里跳过。
     //
-    //  inplace 安全 (attnOutGm_ == attnInGm_):
+    // 非 inplace (attnOutGm_ != attnInGm_): Phase A 读 attnInGm_, Phase C 写
     //  Phase A barrier 之后 user GM 无人再读 (Phase B/C 都从 peermem 读),
     //  Phase C 的 cp-strided UB→GM 写覆盖 user GM 不与任何前序读冲突。
     // ====================================================================
@@ -613,6 +657,66 @@ private:
             }
         }
         // Note: PipeBarrier outside (in Process) covers all srcRank/tile loops.
+    }
+
+    // ====================================================================
+    //  CopyInactiveRows - 非 inplace: 搬运 inactive rows [b0_total, totalT)
+    //  attnInGm_ -> attnOutGm_. 经 UB 中转 (DataCopy 不支持 GM->GM, 对齐
+    //  gm_ub_gm_copy.h 三段式). 按 aivNum 切 inactive rows.
+    //  b0_==0 时 inactive=[0, totalT), 搬全部 rows. 复用 copyBuf_ (Phase C
+    //  后/前空闲). 规避 inplace pass-through 脏数据 (SetRef 未生效时 inactive
+    //  输出为垃圾) -> 非 inplace 显式搬运保证输出确定.
+    // ====================================================================
+    __aicore__ inline void CopyInactiveRows()
+    {
+        uint32_t inactiveStart = b0_;
+        uint32_t inactiveEnd   = totalT_;
+        if (inactiveStart >= inactiveEnd) return;   // 无 inactive rows (b0_ == totalT_)
+
+        // 按 aivNum 切 inactive rows (对齐 SplitCoreCalForToken 切核模式)
+        uint32_t totalInactive = inactiveEnd - inactiveStart;
+        uint32_t perCore  = totalInactive / aivNum_;
+        uint32_t rem      = totalInactive % aivNum_;
+        uint32_t startRow = inactiveStart + perCore * blockIdx_;
+        if (blockIdx_ < rem) {
+            perCore++;
+            startRow += blockIdx_;
+        } else {
+            startRow += rem;
+        }
+        uint32_t endRow = startRow + perCore;
+        if (startRow >= endRow) return;   // idle core (aivNum_ > totalInactive)
+
+        LocalTensor<uint8_t> ubU8 = copyBuf_.Get<uint8_t>();
+        LocalTensor<bfloat16_t> ubAttn = ubU8.ReinterpretCast<bfloat16_t>();
+
+        uint32_t rowsLeft = perCore;
+        uint32_t rowDone  = 0;
+        while (rowsLeft > 0) {
+            uint32_t curRows = rowsLeft > maxRowsPerSubtile_ ? maxRowsPerSubtile_ : rowsLeft;
+            uint32_t srcRow  = startRow + rowDone;
+            int64_t  gmOff   = (int64_t)srcRow * (int64_t)hDim_;
+
+            // GM -> UB (MTE2)
+            GlobalTensor<bfloat16_t> srcGm;
+            srcGm.SetGlobalBuffer(attnInGm_ + gmOff);
+            DataCopyExtParams rd{(uint16_t)curRows, hAttnBytes_, 0, 0, 0};
+            DataCopyPadExtParams<bfloat16_t> pad{false, 0, 0, 0};
+            DataCopyPad(ubAttn, srcGm, rd, pad);
+            SetFlag<HardEvent::MTE2_MTE3>(EV_PP_A);
+            WaitFlag<HardEvent::MTE2_MTE3>(EV_PP_A);
+
+            // UB -> GM (MTE3)
+            GlobalTensor<bfloat16_t> dstGm;
+            dstGm.SetGlobalBuffer(attnOutGm_ + gmOff);
+            DataCopyExtParams wr{(uint16_t)curRows, hAttnBytes_, 0, 0, 0};
+            DataCopyPad(dstGm, ubAttn, wr);
+            SetFlag<HardEvent::MTE3_MTE2>(EV_PP_A);
+            WaitFlag<HardEvent::MTE3_MTE2>(EV_PP_A);
+
+            rowsLeft -= curRows;
+            rowDone  += curRows;
+        }
     }
 
     // 仿 v2 UnpackActiveAttnLseFused 271-338,把 (srcRank, tileStart, tileB0) 作为参数传入.
@@ -681,27 +785,39 @@ private:
     }
 
     // ====================================================================
-    //  Cross-rank sync helpers. The blockIdx_==0 core owns the flag writes
-    //  (the launcher starts aivNum cores, so blockIdx_==0 always exists).
+    //  Cross-rank sync helpers (生产级, 对齐 matmul_reduce_scatter_v2 +
+    //  distribute_barrier). blockIdx_==0 core owns the flag writes (launcher
+    //  starts aivNum cores, so blockIdx_==0 always exists).
+    //
+    //  防 stale 机制: reset 写 RAND_BASE 基线 (SetBuffFlag 覆盖写 flag+RAND_BASE),
+    //  notify 用 SetBuffFlagByAdd (AtomicAdd FLAG_VALUE 累加), wait 用 CheckBuffFlag
+    //  等值 == flag+RAND_BASE. 跨 launch reset 覆盖时, peer 可能读到下一 launch 的
+    //  set 值 (同为 RAND_BASE+FLAG_VALUE) 误判本 launch 完成 - 但误判无害:
+    //  rank 进 launch N+1 的前提是其 launch N check 满足 = 所有 peer launch N Phase C
+    //  已完成, 故误判不破坏数据一致性 (自己的 Phase C 在 check 前).
     // ====================================================================
     __aicore__ inline void CrossRankSyncV1(int32_t flagIdx, int32_t flagVal) {
         if (blockIdx_ == 0) {
-            SetBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                buff_[rankId_] + FLAG_OFFSET + flagIdx * (int32_t)sizeof(int32_t)), flagVal);
+            SetBuffFlagByAdd(reinterpret_cast<__gm__ int32_t*>(
+                buff_[rankId_] + flagOffset_ + flagIdx * (int32_t)sizeof(int32_t)), FLAG_VALUE);
         }
         // Only cp_size_ cores poll peer flags. Extra launcher cores would otherwise
         // duplicate polling on the same peer via modulo and amplify peermem sync cost.
         if (blockIdx_ < cp_size_) {
             CheckBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                buff_[blockIdx_] + FLAG_OFFSET + flagIdx * (int32_t)sizeof(int32_t)), flagVal);
+                buff_[blockIdx_] + flagOffset_ + flagIdx * (int32_t)sizeof(int32_t)),
+                FLAG_VALUE * flagVal);
         }
     }
 
+    // 覆盖写 (用于 reset): S pipe SetValue(flag+RAND_BASE) -> S_MTE3 同步 -> MTE3 DataCopy.
+    // 注意 SetFlag 必须在 SetValue 之后 (S 先写 UB 再通知 MTE3 可读), 旧版 SetFlag 在
+    // SetValue 前是 race bug (MTE3 可能在 SetValue 前读 UB).
     __aicore__ inline void SetBuffFlag(__gm__ int32_t *p, int32_t flag) {
+        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
+        ub.SetValue(0, flag + RAND_BASE);
         SetFlag<HardEvent::S_MTE3>(EV_FLAG_W);
         WaitFlag<HardEvent::S_MTE3>(EV_FLAG_W);
-        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
-        ub.SetValue(0, flag);
         GlobalTensor<int32_t> dst;
         dst.SetGlobalBuffer(p);
         DataCopyExtParams wrParam{1, sizeof(int32_t), 0, 0, 0};
@@ -709,10 +825,32 @@ private:
         PipeBarrier<PIPE_ALL>();
     }
 
+    // AtomicAdd 累加 (用于 notify): 写裸 FLAG_VALUE, SetAtomicAdd 后 DataCopy 到 GM.
+    // 对齐 matmul SetBuffFlagByAdd: 不加 RAND_BASE (累积值 = reset 基线 + 累加次数).
+    __aicore__ inline void SetBuffFlagByAdd(__gm__ int32_t *p, int32_t flag) {
+        PipeBarrier<PIPE_ALL>();
+        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
+        ub.SetValue(0, flag);
+        PipeBarrier<PIPE_ALL>();
+        SetAtomicAdd<int32_t>();
+        PipeBarrier<PIPE_ALL>();
+        GlobalTensor<int32_t> dst;
+        dst.SetGlobalBuffer(p);
+        DataCopyExtParams wrParam{1, sizeof(int32_t), 0, 0, 0};
+        DataCopyPad(dst, ub, wrParam);
+        PipeBarrier<PIPE_ALL>();
+        SetAtomicNone();
+        PipeBarrier<PIPE_ALL>();
+    }
+
+    // 等值等待: MTE2 DataCopy(GM->UB) -> MTE2_S 同步 -> S GetValue 比较 == flag+RAND_BASE.
+    // 加 GetSystemCycle 超时 assert (对齐 distribute_barrier TimeOutTest): flag 正常 <1ms,
+    // 超 10s 即死锁, assert 触发 aicore 退出 (生产 fail-fast, 不静默挂死).
     __aicore__ inline void CheckBuffFlag(__gm__ int32_t *p, int32_t flag) {
         SetFlag<HardEvent::MTE3_MTE2>(EV_FLAG_R);
         WaitFlag<HardEvent::MTE3_MTE2>(EV_FLAG_R);
         LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
+        uint64_t sysBegin = static_cast<uint64_t>(GetSystemCycle());
         while (true) {
             GlobalTensor<int32_t> src;
             src.SetGlobalBuffer(p);
@@ -721,15 +859,25 @@ private:
             DataCopyPad(ub, src, rdParam, padParam);
             SetFlag<HardEvent::MTE2_S>(EV_FLAG_S);
             WaitFlag<HardEvent::MTE2_S>(EV_FLAG_S);
-            if (ub.GetValue(0) == flag) break;
+            if (ub.GetValue(0) == flag + RAND_BASE) {
+                break;
+            }
+            uint64_t sysEnd = static_cast<uint64_t>(GetSystemCycle());
+            uint64_t duration = (sysEnd - sysBegin) / CYCLES_PER_US;
+            if (duration >= SYNC_TIMEOUT_US) {
+                PipeBarrier<PIPE_ALL>();
+                assert(duration < SYNC_TIMEOUT_US);
+                PipeBarrier<PIPE_ALL>();
+            }
         }
     }
 
     __aicore__ inline void ResetIpcFlags(int32_t n) {
         if (blockIdx_ == 0) {
             for (int32_t i = 0; i < n; i++) {
+                // SetBuffFlag(..., 0) 写 0+RAND_BASE = RAND_BASE 基线 (覆盖上 launch 残留).
                 SetBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                    buff_[rankId_] + FLAG_OFFSET + i * (int32_t)sizeof(int32_t)), 0);
+                    buff_[rankId_] + flagOffset_ + i * (int32_t)sizeof(int32_t)), 0);
             }
         }
     }
@@ -789,7 +937,7 @@ private:
     TBuf<TPosition::VECCALC> copyBuf_;              // ping-pong (USED_UB_SIZE)
     TBuf<TPosition::VECCALC> flagBuf_;              // 64B (mask_num + flag I/O)
 
-    // Inplace: attnInGm_ == attnOutGm_. lse is pure input (no lse_out).
+    // 非 inplace: attnInGm_ (read) != attnOutGm_ (write). lse is pure input (no lse_out).
     __gm__ bfloat16_t *attnInGm_{nullptr};
     __gm__ bfloat16_t *attnOutGm_{nullptr};
     __gm__ float      *lseInGm_{nullptr};
@@ -819,6 +967,7 @@ private:
     uint64_t slotCBytesPerRank_   = 0;
     uint64_t slotAOffsetInWin_    = 0;
     uint64_t slotCOffsetInWin_    = 0;
+    uint64_t flagOffset_          = 0;   // 动态 flag 区起始字节偏移 (贴数据区尾, 从 tiling 读)
     uint32_t slotCRowsMax_        = 0;
     uint32_t maxRowsPerSubtile_   = 0;
 

@@ -21,24 +21,27 @@
 namespace vllm_ascend {
 
 at::Tensor& npu_allto_all_attn_update_all_gather(
-    at::Tensor &attn,
-    const at::Tensor &lse,
-    const at::Tensor &mask_num,
+    const at::Tensor& attn_in,
+    const at::Tensor& lse,
+    const at::Tensor& mask_num,
     c10::string_view group,
-    int64_t group_size)
+    int64_t group_size,
+    at::Tensor& attn_out)
 {
-    // Inplace operator: attn is both input and output; lse is a pure input
-    // (read for Phase B weighting, no lse output — downstream does not consume it).
-    // Returns attn ref (mirrors dispatch_ffn_combine) so the inplace output is
-    // bound for Dynamo functionalization + npugraph_ex graph capture.
+    // 非 inplace: attn_in 只读, attn_out 独立写 (对齐 dispatch_ffn_combine x/out 模式).
+    // OpDef Input("attn_in")+Output("attn_out") 不同名 -> 无 SetRef.
+    // lse is a pure input (read for Phase B weighting, no lse output - downstream
+    // does not consume it). Returns attn_out ref for Dynamo functionalization +
+    // npugraph_ex graph capture.
     std::string group_str(group);
     char *group_ptr = group_str.data();
 
     EXEC_NPU_CMD(aclnnAlltoAllAttnUpdateAllGather,
-        attn, lse, mask_num,
-        group_ptr, group_size);
+        attn_in, lse, mask_num,
+        group_ptr, group_size,
+        attn_out);
 
-    return attn;
+    return attn_out;
 }
 
 }

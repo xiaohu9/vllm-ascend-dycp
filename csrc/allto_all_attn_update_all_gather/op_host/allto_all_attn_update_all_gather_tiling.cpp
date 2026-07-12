@@ -96,21 +96,21 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
     const gert::StorageShape *attnShape = context->GetInputShape(0);   // [totalT, n/cp·D]
     const gert::StorageShape *lseShape  = context->GetInputShape(1);   // [totalT, n/cp]
     OP_TILING_CHECK(attnShape == nullptr,
-        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(), "attn_ref shape is nullptr"),
+        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(), "attn shape is nullptr"),
         return ge::GRAPH_FAILED);
     OP_TILING_CHECK(lseShape == nullptr,
-        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(), "lse_ref shape is nullptr"),
+        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(), "lse shape is nullptr"),
         return ge::GRAPH_FAILED);
 
     const auto &attnStorage = attnShape->GetStorageShape();
     const auto &lseStorage  = lseShape->GetStorageShape();
     OP_TILING_CHECK(attnStorage.GetDimNum() != 2,
         VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
-            "attn_ref must be 2D, got %zu dims", attnStorage.GetDimNum()),
+            "attn must be 2D, got %zu dims", attnStorage.GetDimNum()),
         return ge::GRAPH_FAILED);
     OP_TILING_CHECK(lseStorage.GetDimNum() != 2,
         VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
-            "lse_ref must be 2D, got %zu dims", lseStorage.GetDimNum()),
+            "lse must be 2D, got %zu dims", lseStorage.GetDimNum()),
         return ge::GRAPH_FAILED);
 
     uint32_t totalT = static_cast<uint32_t>(attnStorage.GetDim(0));
@@ -119,15 +119,15 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
 
     OP_TILING_CHECK(static_cast<uint32_t>(lseStorage.GetDim(0)) != totalT,
         VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
-            "lse_ref.dim(0)=%u must equal attn_ref.dim(0)=%u",
+            "lse.dim(0)=%u must equal attn.dim(0)=%u",
             static_cast<uint32_t>(lseStorage.GetDim(0)), totalT),
         return ge::GRAPH_FAILED);
     OP_TILING_CHECK(lseDim == 0,
-        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(), "lse_ref.dim(1) must be > 0"),
+        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(), "lse.dim(1) must be > 0"),
         return ge::GRAPH_FAILED);
     OP_TILING_CHECK(hDim % lseDim != 0,
         VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
-            "attn_ref.dim(1)=%u must be a multiple of lse_ref.dim(1)=%u (D)",
+            "attn.dim(1)=%u must be a multiple of lse.dim(1)=%u (D)",
             hDim, lseDim),
         return ge::GRAPH_FAILED);
 

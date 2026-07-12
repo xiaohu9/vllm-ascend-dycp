@@ -4,10 +4,10 @@
  * AlltoAllAttnUpdateAllGather Kernel
  *
  * Per-token block-transpose AlltoAll (Phase A) → cross-cp LSE-weighted reduce
- * (Phase B) → head-AllGather + permute (Phase C). Inplace: attn_ref shares GM
- * in-out; lse is a pure input (read for weighting, no lse output — downstream
+ * (Phase B) → head-AllGather + permute (Phase C). 非 inplace: attn_in (read) / attn_out (write) 为
+ * 独立 GM (无 SetRef); lse is a pure input (read for weighting, no lse output — downstream
  * does not consume it). Active rows [0, b0_total) follow A→B→C; inactive rows
- * [b0_total, totalT) are left untouched (pass-through).
+ * [b0_total, totalT) explicitly copied attn_in -> attn_out.
  *
  * Phase A routing: row r → target rank = r % cp_size_, via peermem windows.
  *   b0_total = mask_num × cp_size_  (per-rank, b0 % cp == 0).
@@ -44,11 +44,13 @@ using namespace AscendC;
 constexpr uint32_t USED_UB_SIZE          = 160 * 1024;        // fused row ping-pong total
 constexpr uint32_t USED_UB_HALF          = USED_UB_SIZE / 2;
 
-// -- Peermem sync (生产级, 对齐 matmul_reduce_scatter_v2 + distribute_barrier) --
-// flag 区起始偏移 flagOffset_ 改从 tiling 动态读取 (贴数据区尾), 不再硬编 100MB (Bug #1:
+// -- Peermem cross-rank sync (方案 A: mega_moe 单调计数器语义, DataCopyPad 可移植原语) --
+// flag 区起始偏移 flagOffset_ 从 tiling 动态读取 (贴数据区尾), 不硬编 (Bug #1:
 // 旧硬编 100MB 可能落到 slotA/slotC 数据区中段被 Phase A/C 数据写覆盖).
-constexpr int32_t  FLAG_VALUE            = 1;                  // SetBuffFlagByAdd 单次累加值
-constexpr int32_t  RAND_BASE             = 3;                  // reset 基线: reset 写 RAND_BASE, set AtomicAdd 累加, check 等值 flag+RAND_BASE (防跨 launch stale)
+// flag[0] 兼作持久单调计数器: Init 读 own flag[0] (上一 launch 的 launchCount) +1 得本
+// launch launchCount (uint32 良定义回绕, ~4.3e9 launches, 全 rank 归纳同步). 各 stage 写
+// own flag[stage]=launchCount, 轮询 peer flag[stage]==launchCount. 相邻 launch 值恒不同 ->
+// 跨 launch 陈旧标志被拒 (修正原常数 flagVal+RAND_BASE 无法区分 launch N/N+1 的竞争).
 constexpr uint64_t CYCLES_PER_US         = 50UL;               // GetSystemCycle 计数器频率 (对齐 distribute_barrier.h:43)
 constexpr uint64_t SYNC_TIMEOUT_US       = 10ULL * 1000ULL * 1000ULL;  // 10s 死锁护栏 (flag 正常 <1ms, 超时即 assert)
 
@@ -150,10 +152,13 @@ public:
 
         ComputeTileParams();
 
-        // Reset peermem flag area (3 flags reserved for 3 cross-rank syncs across A/B/C).
-        // Only blockIdx_ == 0 writes; others wait via SyncAll.
-        ResetIpcFlags(3);
-        SyncAll<true>();   // 保证所有 core 的 flag 区 reset 完成 (基线 RAND_BASE 就绪) 才进 Process
+        // 方案 A: 读 own flag[0] (上一 launch 的 launchCount) +1 得本 launch launchCount.
+        // 各 core 读同一 own window GM 地址, 无写竞争, 值一致. flag[0] 兼作持久计数器
+        // (无 reset, 无单独 counter 区). 依赖 peermem window 清零 (首 launch flag[0]=0 ->
+        // launchCount_=1), 与 mega_moe syncCount 同假设. uint32 良定义回绕 (~4.3e9 launches).
+        launchCount_ = static_cast<uint32_t>(ReadGmInt32(reinterpret_cast<__gm__ int32_t*>(
+            buff_[rankId_] + flagOffset_))) + 1u;
+        SyncAll<true>();   // 保证所有 core 的 launchCount_ 就绪才进 Process
     }
 
     __aicore__ inline void Process()
@@ -178,14 +183,14 @@ public:
         PhaseAPack();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();                       // A barrier #1
-        CrossRankSyncV1(0, 1);
+        CrossRankSyncMega(0);
         SyncAll<true>();                       // A barrier #2
 
         // ---- Phase B: cross-cp LSE-weighted reduce (M3) ----
         PhaseBReduce();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();                       // B barrier #1
-        CrossRankSyncV1(1, 1);
+        CrossRankSyncMega(1);
         SyncAll<true>();                       // B barrier #2
 
         // ---- Phase C: head-AllGather Combine (M4) ----
@@ -195,7 +200,7 @@ public:
         PhaseCCombine();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();                       // C barrier #1
-        CrossRankSyncV1(2, 1);
+        CrossRankSyncMega(2);
         SyncAll<true>();                       // C barrier #2
 
         // 非 inplace: 搬运 inactive rows [b0_total, totalT) attn_in -> attn_out
@@ -785,37 +790,37 @@ private:
     }
 
     // ====================================================================
-    //  Cross-rank sync helpers (生产级, 对齐 matmul_reduce_scatter_v2 +
-    //  distribute_barrier). blockIdx_==0 core owns the flag writes (launcher
-    //  starts aivNum cores, so blockIdx_==0 always exists).
+    //  Cross-rank sync helpers (方案 A: mega_moe 单调计数器语义, DataCopyPad 可移植原语).
+    //  对齐 mega_moe CrossRankSyncInWorldSize: 各 rank 写 own window[stage]=launchCount_,
+    //  轮询 peer window[stage]==launchCount_. launchCount_ 单调递增 (本 launch 唯一值),
+    //  相邻 launch 值恒不同 (含 uint32 回绕点 UINT32_MAX vs 0), 天然防 stale -
+    //  无需 reset/RAND_BASE (修正原常数 flagVal+RAND_BASE 无法区分 launch N/N+1 的竞争).
     //
-    //  防 stale 机制: reset 写 RAND_BASE 基线 (SetBuffFlag 覆盖写 flag+RAND_BASE),
-    //  notify 用 SetBuffFlagByAdd (AtomicAdd FLAG_VALUE 累加), wait 用 CheckBuffFlag
-    //  等值 == flag+RAND_BASE. 跨 launch reset 覆盖时, peer 可能读到下一 launch 的
-    //  set 值 (同为 RAND_BASE+FLAG_VALUE) 误判本 launch 完成 - 但误判无害:
-    //  rank 进 launch N+1 的前提是其 launch N check 满足 = 所有 peer launch N Phase C
-    //  已完成, 故误判不破坏数据一致性 (自己的 Phase C 在 check 前).
+    //  角色分工: blockIdx_==0 写 own flag (launcher 启 aivNum cores, blockIdx_==0 必存在);
+    //  blockIdx_<cp_size_ 轮询 peer flag (多余 launcher core 不轮询, 避免重复 peermem 读).
+    //  core0 同时写 own + 读 peer, 经 PipeBarrier<PIPE_ALL> 隔离两段对 flagBuf_ UB 的复用.
     // ====================================================================
-    __aicore__ inline void CrossRankSyncV1(int32_t flagIdx, int32_t flagVal) {
+    __aicore__ inline void CrossRankSyncMega(int32_t stage) {
+        __gm__ int32_t *ownFlag = reinterpret_cast<__gm__ int32_t*>(
+            buff_[rankId_] + flagOffset_ + stage * (int32_t)sizeof(int32_t));
         if (blockIdx_ == 0) {
-            SetBuffFlagByAdd(reinterpret_cast<__gm__ int32_t*>(
-                buff_[rankId_] + flagOffset_ + flagIdx * (int32_t)sizeof(int32_t)), FLAG_VALUE);
+            WriteOwnFlag(ownFlag, launchCount_);
         }
         // Only cp_size_ cores poll peer flags. Extra launcher cores would otherwise
         // duplicate polling on the same peer via modulo and amplify peermem sync cost.
         if (blockIdx_ < cp_size_) {
-            CheckBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                buff_[blockIdx_] + flagOffset_ + flagIdx * (int32_t)sizeof(int32_t)),
-                FLAG_VALUE * flagVal);
+            __gm__ int32_t *peerFlag = reinterpret_cast<__gm__ int32_t*>(
+                buff_[blockIdx_] + flagOffset_ + stage * (int32_t)sizeof(int32_t));
+            WaitPeerFlag(peerFlag, launchCount_);
         }
     }
 
-    // 覆盖写 (用于 reset): S pipe SetValue(flag+RAND_BASE) -> S_MTE3 同步 -> MTE3 DataCopy.
-    // 注意 SetFlag 必须在 SetValue 之后 (S 先写 UB 再通知 MTE3 可读), 旧版 SetFlag 在
-    // SetValue 前是 race bug (MTE3 可能在 SetValue 前读 UB).
-    __aicore__ inline void SetBuffFlag(__gm__ int32_t *p, int32_t flag) {
+    // 覆盖写 own flag=launchCount_: S pipe SetValue -> S_MTE3 同步 -> MTE3 DataCopy 写 GM.
+    // SetFlag 必须在 SetValue 之后 (S 先写 UB 再通知 MTE3 可读), 反之为 race bug.
+    // uint32->int32 为 bit-preserving cast, 往返一致 (含回绕点 INT32_MAX 边界).
+    __aicore__ inline void WriteOwnFlag(__gm__ int32_t *p, uint32_t val) {
         LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
-        ub.SetValue(0, flag + RAND_BASE);
+        ub.SetValue(0, static_cast<int32_t>(val));
         SetFlag<HardEvent::S_MTE3>(EV_FLAG_W);
         WaitFlag<HardEvent::S_MTE3>(EV_FLAG_W);
         GlobalTensor<int32_t> dst;
@@ -825,28 +830,11 @@ private:
         PipeBarrier<PIPE_ALL>();
     }
 
-    // AtomicAdd 累加 (用于 notify): 写裸 FLAG_VALUE, SetAtomicAdd 后 DataCopy 到 GM.
-    // 对齐 matmul SetBuffFlagByAdd: 不加 RAND_BASE (累积值 = reset 基线 + 累加次数).
-    __aicore__ inline void SetBuffFlagByAdd(__gm__ int32_t *p, int32_t flag) {
-        PipeBarrier<PIPE_ALL>();
-        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
-        ub.SetValue(0, flag);
-        PipeBarrier<PIPE_ALL>();
-        SetAtomicAdd<int32_t>();
-        PipeBarrier<PIPE_ALL>();
-        GlobalTensor<int32_t> dst;
-        dst.SetGlobalBuffer(p);
-        DataCopyExtParams wrParam{1, sizeof(int32_t), 0, 0, 0};
-        DataCopyPad(dst, ub, wrParam);
-        PipeBarrier<PIPE_ALL>();
-        SetAtomicNone();
-        PipeBarrier<PIPE_ALL>();
-    }
-
-    // 等值等待: MTE2 DataCopy(GM->UB) -> MTE2_S 同步 -> S GetValue 比较 == flag+RAND_BASE.
-    // 加 GetSystemCycle 超时 assert (对齐 distribute_barrier TimeOutTest): flag 正常 <1ms,
-    // 超 10s 即死锁, assert 触发 aicore 退出 (生产 fail-fast, 不静默挂死).
-    __aicore__ inline void CheckBuffFlag(__gm__ int32_t *p, int32_t flag) {
+    // 轮询 peer flag==launchCount_: MTE3_MTE2 一次性排序 (隔离前段 WriteOwnFlag 的 MTE3 写
+    // 与本段 MTE2 读, 二者共 flagBuf_ UB), 循环 MTE2 DataCopy(GM->UB) -> MTE2_S -> S GetValue
+    // 比较. uint32 比较保回绕正确 (bit-preserving cast 往返一致). 加 GetSystemCycle 10s 超时
+    // assert (对齐 distribute_barrier): flag 正常 <1ms, 超时即死锁 fail-fast.
+    __aicore__ inline void WaitPeerFlag(__gm__ int32_t *p, uint32_t val) {
         SetFlag<HardEvent::MTE3_MTE2>(EV_FLAG_R);
         WaitFlag<HardEvent::MTE3_MTE2>(EV_FLAG_R);
         LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
@@ -859,7 +847,7 @@ private:
             DataCopyPad(ub, src, rdParam, padParam);
             SetFlag<HardEvent::MTE2_S>(EV_FLAG_S);
             WaitFlag<HardEvent::MTE2_S>(EV_FLAG_S);
-            if (ub.GetValue(0) == flag + RAND_BASE) {
+            if (static_cast<uint32_t>(ub.GetValue(0)) == val) {
                 break;
             }
             uint64_t sysEnd = static_cast<uint64_t>(GetSystemCycle());
@@ -872,14 +860,22 @@ private:
         }
     }
 
-    __aicore__ inline void ResetIpcFlags(int32_t n) {
-        if (blockIdx_ == 0) {
-            for (int32_t i = 0; i < n; i++) {
-                // SetBuffFlag(..., 0) 写 0+RAND_BASE = RAND_BASE 基线 (覆盖上 launch 残留).
-                SetBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                    buff_[rankId_] + flagOffset_ + i * (int32_t)sizeof(int32_t)), 0);
-            }
-        }
+    // Init 读 own flag[0] (上一 launch 的 launchCount). PipeBarrier<PIPE_ALL> 排序前序 flagBuf_
+    // UB 操作 (ReadMaskNum 的 MTE2 写 + S GetValue), 避免本段 MTE2 写抢在前序 S GetValue 前
+    // 覆写 flagBuf_[0] (跨 pipe 无 FIFO). 仅 Init 调用一次, PipeBarrier 开销可忽略.
+    // MTE2 DataCopy(GM->UB) -> MTE2_S -> S GetValue. 返回 int32 (bit-preserving, Init 处
+    // static_cast<uint32_t>+1u 还原回绕语义).
+    __aicore__ inline int32_t ReadGmInt32(__gm__ int32_t *p) {
+        PipeBarrier<PIPE_ALL>();
+        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
+        GlobalTensor<int32_t> src;
+        src.SetGlobalBuffer(p);
+        DataCopyExtParams rdParam{1, sizeof(int32_t), 0, 0, 0};
+        DataCopyPadExtParams<int32_t> padParam{false, 0, 0, 0};
+        DataCopyPad(ub, src, rdParam, padParam);
+        SetFlag<HardEvent::MTE2_S>(EV_FLAG_S);
+        WaitFlag<HardEvent::MTE2_S>(EV_FLAG_S);
+        return ub.GetValue(0);
     }
 
     // ====================================================================
@@ -968,6 +964,7 @@ private:
     uint64_t slotAOffsetInWin_    = 0;
     uint64_t slotCOffsetInWin_    = 0;
     uint64_t flagOffset_          = 0;   // 动态 flag 区起始字节偏移 (贴数据区尾, 从 tiling 读)
+    uint32_t launchCount_         = 0;   // 方案 A: 本 launch 单调计数 (Init 由 own flag[0]+1 派生)
     uint32_t slotCRowsMax_        = 0;
     uint32_t maxRowsPerSubtile_   = 0;
 

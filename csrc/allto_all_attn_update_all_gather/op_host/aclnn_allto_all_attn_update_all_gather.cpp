@@ -177,7 +177,7 @@ static aclnnStatus CheckParams(const aclTensor *attn_in, const aclTensor *attn_o
 }
 
 // ============================================================================
-// Stage 1: GetWorkspaceSize  (inplace: outer API takes 3 tensors)
+// Stage 1: GetWorkspaceSize  (non-inplace: outer API takes 4 tensors)
 // ============================================================================
 
 aclnnStatus aclnnAlltoAllAttnUpdateAllGatherGetWorkspaceSize(

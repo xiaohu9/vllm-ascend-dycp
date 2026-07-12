@@ -3,8 +3,8 @@
  *
  * AlltoAllAttnUpdateAllGather Tiling Data Structure (Kernel-side)
  *
- * Inplace: attn_ref == attn (same GM address); lse_ref == lse.
- * Active rows [0, b0_total) Phase A→B→C; inactive rows pass-through.
+ * 非 inplace: attn_in (read) 与 attn_out (write) 独立 GM (无 SetRef); lse 纯 input.
+ * Active rows [0, b0_total) Phase A→B→C; inactive rows 由 CopyInactiveRows 显式搬运.
  *
  * CRITICAL: Mc2InitTiling and Mc2CcTiling MUST be at the front of this struct.
  *

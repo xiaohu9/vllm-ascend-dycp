@@ -42,6 +42,8 @@ using namespace AscendC;
 
 // -- Static knobs --
 constexpr int32_t  FLAG_OFFSET           = 100 * 1024 * 1024;
+constexpr uint64_t CYCLES_PER_US   = 50ULL;
+constexpr uint64_t SYNC_TIMEOUT_US = 10ULL * 1000ULL * 1000ULL;   // 10s 死锁 fail-fast
 constexpr uint32_t USED_UB_SIZE          = 160 * 1024;        // fused row ping-pong total
 constexpr uint32_t USED_UB_HALF          = USED_UB_SIZE / 2;
 
@@ -70,6 +72,44 @@ constexpr int32_t EV_B_MTE3_V = 0;  // MTE3 (last write) → V (next-token reloa
 
 __aicore__ inline int64_t AlignUp32(int64_t x) { return (x + 31) / 32 * 32; }
 __aicore__ inline uint32_t AlignUp8(uint32_t x) { return (x + NUM7) / NUM8 * NUM8; }
+// ---- Peermem scalar sync primitives (对齐 dispatch_ffn_combine hccl_shmem.hpp L31-64) ----
+// flag 同步改 scalar 直访 GM + DataCacheCleanAndInvalid, 替代旧 DataCopyPad DMA 跨 chip 读
+// (旧 CheckBuffFlag reader 跨 chip peermem 读 peer window flag, DMA ordering 不保证 -> 读 stale).
+// 新方案双向握手: writer gm_store 写 peer window (跨 chip) + gm_dcci clean; reader gm_load
+// 读自己 window (本地) + gm_dcci invalid. reader 始终本地读, 跨 chip 只在 writer.
+template <typename T>
+__aicore__ inline void gm_store(__gm__ T* addr, T val) {
+    *((__gm__ T*)addr) = val;
+}
+template <typename T>
+__aicore__ inline T gm_load(__gm__ T* cache) {
+    return *((__gm__ T*)cache);
+}
+template <typename T>
+__aicore__ inline void gm_dcci(__gm__ T* addr) {
+    GlobalTensor<uint8_t> global;
+    global.SetGlobalBuffer(reinterpret_cast<GM_ADDR>(addr));
+    __asm__ __volatile__("");
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(global);
+    __asm__ __volatile__("");
+}
+// 轮询等 *sig_addr == cmp_val (本地读自己 window). 每轮 gm_dcci invalid 清陈旧 dcache.
+// 只等 == cmp_val (不加 hccl_shmem cmp_val+1 容错: 同 launch 3 stage launchCount_ 不变,
+// +1 = 下一 launch 值, 读到它说明 peer 已进下一 launch data 已被覆写 -> 误判 -> 精度错).
+// 带 GetSystemCycle 10s 超时 assert (对齐 distribute_barrier.h: 死锁 fail-fast).
+__aicore__ inline void gm_signal_wait(__gm__ int32_t* sig_addr, int32_t cmp_val) {
+    uint64_t sysBegin = static_cast<uint64_t>(GetSystemCycle());
+    while (true) {
+        gm_dcci(reinterpret_cast<__gm__ uint8_t*>(sig_addr));
+        if (*sig_addr == cmp_val) { return; }
+        uint64_t duration = (static_cast<uint64_t>(GetSystemCycle()) - sysBegin) / CYCLES_PER_US;
+        if (duration >= SYNC_TIMEOUT_US) {
+            PipeBarrier<PIPE_ALL>();
+            assert(duration < SYNC_TIMEOUT_US);
+            PipeBarrier<PIPE_ALL>();
+        }
+    }
+}
 
 template <typename TilingT>
 class KernelAlltoAllAttnUpdateAllGather {
@@ -135,9 +175,21 @@ public:
 
         ComputeTileParams();
 
-        // Reset peermem flag area (3 flags reserved for 3 cross-rank syncs across A/B/C).
-        // Only blockIdx_ == 0 writes; others wait via SyncAll.
-        ResetIpcFlags(3);
+        // ---- launchCount_ 派生 + counter 更新 (对齐 dispatch_ffn_combine hccl_shmem.hpp) ----
+        // counter @ FLAG_OFFSET (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
+        // launchCount_ (uint32 单调, 良定义回绕 ~4.3e9 launches, 区分 launch 防 stale flag).
+        // 各 core 读同一本地 counter, 值一致; 读后 SyncAll 保证都读完, 再 core0 写 counter=
+        // launchCount_ 供下一 launch (读写分离防竞争). gm_dcci: 读前 invalid 清陈旧 dcache,
+        // 写后 clean 刷 GM 使下一 launch 可见.
+        __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + FLAG_OFFSET);
+        gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
+        launchCount_ = static_cast<uint32_t>(gm_load(counter)) + 1u;
+        SyncAll<true>();   // 所有 core 读完 counter, launchCount_ 就绪
+        if (blockIdx_ == 0) {
+            gm_store(counter, static_cast<int32_t>(launchCount_));
+            gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
+        }
+        SyncAll<true>();   // core0 counter 写完才进 Process
     }
 
     __aicore__ inline void Process()
@@ -148,11 +200,17 @@ public:
         SplitCoreCalForToken();
 
         if (b0_ == 0) {
-            // No active token: kernel writes nothing. Cross every barrier so launcher-wide
-            // SyncAll gathers. 6 SyncAll covers A/B/C three sync rounds.
+            // No active token: inplace pass-through (attn_out==attn_in, inactive rows 不搬).
+            // 但仍需 3 stage CrossRankSyncV1 (防御性: 防 mask_num 跨 rank 不一致时 b0_>0 rank
+            // 等 b0_==0 rank flag 死锁). b0_==0 时 Phase A/B/C for 循环空, sync 无 data 依赖.
+            PipeBarrier<PIPE_ALL>();
+            SyncAll<true>();
+            CrossRankSyncV1(0);
             SyncAll<true>(); SyncAll<true>();
+            CrossRankSyncV1(1);
             SyncAll<true>(); SyncAll<true>();
-            SyncAll<true>(); SyncAll<true>();
+            CrossRankSyncV1(2);
+            SyncAll<true>();
             return;
         }
 
@@ -160,14 +218,14 @@ public:
         PhaseAPack();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();                       // A barrier #1
-        CrossRankSyncV1(0, 1);
+        CrossRankSyncV1(0);
         SyncAll<true>();                       // A barrier #2
 
         // ---- Phase B: cross-cp LSE-weighted reduce (M3) ----
         PhaseBReduce();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();                       // B barrier #1
-        CrossRankSyncV1(1, 1);
+        CrossRankSyncV1(1);
         SyncAll<true>();                       // B barrier #2
 
         // ---- Phase C: head-AllGather Combine (M4) ----
@@ -177,7 +235,7 @@ public:
         PhaseCCombine();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();                       // C barrier #1
-        CrossRankSyncV1(2, 1);
+        CrossRankSyncV1(2);
         SyncAll<true>();                       // C barrier #2
     }
 
@@ -681,57 +739,36 @@ private:
     }
 
     // ====================================================================
-    //  Cross-rank sync helpers. The blockIdx_==0 core owns the flag writes
-    //  (the launcher starts aivNum cores, so blockIdx_==0 always exists).
+    //  Cross-rank sync (对齐 dispatch_ffn_combine hccl_shmem.hpp CrossRankSync + mega_moe
+    //  CrossRankSyncInWorldSize). 双向握手: rank R core i 写 peer i window[rankId_ slot, stage]
+    //  = launchCount_ (跨 chip peermem 写, gm_store+gm_dcci clean); 等自己 window[peer i slot, stage]
+    //  == launchCount_ (本地读, gm_signal_wait 每轮 gm_dcci invalid). reader 始终本地读, 跨 chip
+    //  只在 writer -> 规避旧 CheckBuffFlag 跨 chip peermem 读 flag 的 DMA ordering 不保证问题.
+    //  launchCount_ 单调计数器替代固定 flagVal=1 -> 区分 launch, 防 reader 读到上 launch 残留 flag
+    //  误判就绪 -> 读 stale data ("输出像前次 launch" 根因).
+    //
+    //  flag 区布局 (每 rank window @ FLAG_OFFSET): counter @ +0 (1 int32); stage s sync 区 @
+    //  +64+s*cp_size_*64, 每 rank slot 16 int32 (64B cacheline 对齐, 各 slot 独立 cacheline 防串扰).
+    //  core 分摊: for i=blockIdx_; i<cp_size_; i+=aivNum_ (aivNum_>=cp_size_ 由 tiling 保证,
+    //  每 core 至多 1 peer; 多余 core 空操作, 外部 SyncAll 对齐).
+    //  末尾 PipeBarrier<PIPE_ALL>: 保证 S 读 flag 先于后续 MTE2 读 data (跨 pipe ordering).
     // ====================================================================
-    __aicore__ inline void CrossRankSyncV1(int32_t flagIdx, int32_t flagVal) {
-        if (blockIdx_ == 0) {
-            SetBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                buff_[rankId_] + FLAG_OFFSET + flagIdx * (int32_t)sizeof(int32_t)), flagVal);
+    __aicore__ inline void CrossRankSyncV1(int32_t stage) {
+        int32_t count = static_cast<int32_t>(launchCount_);
+        uint64_t stageBase = (uint64_t)FLAG_OFFSET + 64ULL
+            + (uint64_t)stage * (uint64_t)cp_size_ * 64ULL;
+        for (uint32_t i = blockIdx_; i < cp_size_; i += aivNum_) {
+            // 1. 写 peer i window[rankId_ slot, stage] = count (跨 chip peermem 写)
+            __gm__ int32_t *peerSlot = reinterpret_cast<__gm__ int32_t*>(
+                buff_[i] + stageBase) + (int32_t)rankId_ * 16;
+            gm_store(peerSlot, count);
+            gm_dcci(reinterpret_cast<__gm__ uint8_t*>(peerSlot));
+            // 2. 等自己 window[peer i slot, stage] == count (本地读)
+            __gm__ int32_t *mySlot = reinterpret_cast<__gm__ int32_t*>(
+                buff_[rankId_] + stageBase) + (int32_t)i * 16;
+            gm_signal_wait(mySlot, count);
         }
-        // Only cp_size_ cores poll peer flags. Extra launcher cores would otherwise
-        // duplicate polling on the same peer via modulo and amplify peermem sync cost.
-        if (blockIdx_ < cp_size_) {
-            CheckBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                buff_[blockIdx_] + FLAG_OFFSET + flagIdx * (int32_t)sizeof(int32_t)), flagVal);
-        }
-    }
-
-    __aicore__ inline void SetBuffFlag(__gm__ int32_t *p, int32_t flag) {
-        SetFlag<HardEvent::S_MTE3>(EV_FLAG_W);
-        WaitFlag<HardEvent::S_MTE3>(EV_FLAG_W);
-        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
-        ub.SetValue(0, flag);
-        GlobalTensor<int32_t> dst;
-        dst.SetGlobalBuffer(p);
-        DataCopyExtParams wrParam{1, sizeof(int32_t), 0, 0, 0};
-        DataCopyPad(dst, ub, wrParam);
         PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ inline void CheckBuffFlag(__gm__ int32_t *p, int32_t flag) {
-        SetFlag<HardEvent::MTE3_MTE2>(EV_FLAG_R);
-        WaitFlag<HardEvent::MTE3_MTE2>(EV_FLAG_R);
-        LocalTensor<int32_t> ub = flagBuf_.Get<int32_t>();
-        while (true) {
-            GlobalTensor<int32_t> src;
-            src.SetGlobalBuffer(p);
-            DataCopyExtParams rdParam{1, sizeof(int32_t), 0, 0, 0};
-            DataCopyPadExtParams<int32_t> padParam{false, 0, 0, 0};
-            DataCopyPad(ub, src, rdParam, padParam);
-            SetFlag<HardEvent::MTE2_S>(EV_FLAG_S);
-            WaitFlag<HardEvent::MTE2_S>(EV_FLAG_S);
-            if (ub.GetValue(0) == flag) break;
-        }
-    }
-
-    __aicore__ inline void ResetIpcFlags(int32_t n) {
-        if (blockIdx_ == 0) {
-            for (int32_t i = 0; i < n; i++) {
-                SetBuffFlag(reinterpret_cast<__gm__ int32_t*>(
-                    buff_[rankId_] + FLAG_OFFSET + i * (int32_t)sizeof(int32_t)), 0);
-            }
-        }
     }
 
     // ====================================================================
@@ -829,6 +866,9 @@ private:
     uint32_t sendTokenNum_  = 0;
     uint32_t startTokenId_  = 0;
     uint32_t endTokenId_    = 0;
+
+    // ---- cross-rank sync ----
+    uint32_t launchCount_     = 0;
 };
 
 }  // namespace AlltoAllAttnUpdateAllGather

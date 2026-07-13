@@ -244,6 +244,27 @@ static ge::graphStatus AlltoAllAttnUpdateAllGatherTilingFunc(gert::TilingContext
             (unsigned long)tilingData->slotCBytesPerRank),
         return ge::GRAPH_FAILED);
 
+    // ---------- 4b. flag 区越界检查 ----------
+    // flag 区 @ FLAG_OFFSET (kernel.h) = 100MB; data 区 [0, neededWinBytes). 需 data 不侵入
+    // flag 区, 且 flag 区在 window 内 (防 data>100MB 时 flag 越界 data -> 精度错/内存越界).
+    // flag 区 = counter(64B) + 3 stage * cp_size_ * 64B = 64 + cp*192.
+    constexpr uint64_t FLAG_OFFSET_BYTES   = 100ULL * 1024ULL * 1024ULL;
+    constexpr uint64_t FLAG_REGION_BYTES   = 64ULL + (uint64_t)groupSize * 192ULL;
+    OP_TILING_CHECK(static_cast<uint64_t>(neededWinBytes) > FLAG_OFFSET_BYTES,
+        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
+            "peermem data region overlaps flag region: neededWinBytes %ld > FLAG_OFFSET %lu "
+            "(cp=%u totalT=%u rowSize=%u). Reduce D/totalT or increase HCCL_BUFFSIZE.",
+            neededWinBytes, (unsigned long)FLAG_OFFSET_BYTES, groupSize, totalT,
+            tilingData->rowSize),
+        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(FLAG_OFFSET_BYTES + FLAG_REGION_BYTES > maxWinBytes,
+        VECTOR_INNER_ERR_REPORT_TILING(context->GetNodeName(),
+            "peermem flag region exceeds window: FLAG_OFFSET %lu + flagRegion %lu > maxWin %lu. "
+            "Increase HCCL_BUFFSIZE.",
+            (unsigned long)FLAG_OFFSET_BYTES, (unsigned long)FLAG_REGION_BYTES,
+            (unsigned long)maxWinBytes),
+        return ge::GRAPH_FAILED);
+
     // ---------- 5. HCCL window allocation (no collective is ever issued) ----------
     // commtype = ALLTOALLV(8); A3 拓扑(910_93) HCCL 内部按 group 自动识别,
     // algConfig 字符串与邻居 dispatch_ffn_combine 同款.

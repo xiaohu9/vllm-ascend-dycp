@@ -190,6 +190,11 @@ public:
             gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
         }
         SyncAll<true>();   // core0 counter 写完才进 Process
+        if (blockIdx_ == 0) {
+            AscendC::printf("[ATU_DBG] INIT rank=%u launchCount=%u b0=%u attnIn=%llu attnOut=%llu\n",
+                            rankId_, launchCount_, b0_,
+                            (uint64_t)attnInGm_, (uint64_t)attnOutGm_);
+        }
     }
 
     __aicore__ inline void Process()
@@ -200,6 +205,9 @@ public:
         SplitCoreCalForToken();
 
         if (b0_ == 0) {
+            if (blockIdx_ == 0) {
+                AscendC::printf("[ATU_DBG] PASS_THROUGH rank=%u b0=0 (stale mask_num?)\n", rankId_);
+            }
             // No active token: inplace pass-through (attn_out==attn_in, inactive rows 不搬).
             // 但仍需 3 stage CrossRankSyncV1 (防御性: 防 mask_num 跨 rank 不一致时 b0_>0 rank
             // 等 b0_==0 rank flag 死锁). b0_==0 时 Phase A/B/C for 循环空, sync 无 data 依赖.
@@ -796,6 +804,17 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
         b0_raw_ = (uint32_t)ub.GetValue(0);
+        if (blockIdx_ == 0) {
+            AscendC::printf("[ATU_DBG] READ_MASK rank=%u b0_raw=%u maskGm=%llu\n",
+                            rankId_, b0_raw_, (uint64_t)maskNumGm_);
+            // 验证 #3: graph replay 是否把当前 attn/lse 送到 capture 地址.
+            // pass-through(b0=0)不写 attn, 输出=读到的 attn. 若 replay 读 stale(capture dummy)
+            // -> 输出错. 对比 capture pass vs replay 的 attnIn[0]/lse[0]: 不变=stale(#3), 变=已copy.
+            uint16_t attnBits = gm_load<uint16_t>(reinterpret_cast<__gm__ uint16_t*>(attnInGm_));
+            float lse0 = gm_load<float>(lseInGm_);
+            AscendC::printf("[ATU_DBG] ATTN_LSE rank=%u attnIn[0]=0x%04x lse[0]=%.6f\n",
+                            rankId_, (uint32_t)attnBits, lse0);
+        }
     }
 
     __aicore__ inline void ComputeTileParams() {

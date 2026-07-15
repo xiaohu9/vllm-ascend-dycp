@@ -58,6 +58,12 @@ public:
     //   keeps ubInFp32/ubAttnBf at k*blockElems (not cp*blockElems), UB <= 160KB.
     // k=cp single-batch (== old one-shot); k<cp multi-batch streaming sum.
     uint32_t cpBatchSize;              // Phase B per-batch cp count (Rev 5.7)
+
+    // ===== Flag region offset (Rev 5.8 动态, 贴 window 末尾) =====
+    // flagOffsetBytes = maxWinBytes - FLAG_REGION_BYTES (64 + cp*192); counter @ +0,
+    // stage s @ +64+s*cp*64. 各 rank 一致 (HCCL_BUFFSIZE 同); 64B cacheline 对齐.
+    // 替代旧硬编 100MB, 解除数据区 100MB 上限.
+    uint64_t flagOffsetBytes;
 };
 
 }  // namespace Mc2Tiling

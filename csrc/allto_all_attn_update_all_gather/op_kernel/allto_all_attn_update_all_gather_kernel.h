@@ -41,7 +41,7 @@ namespace AlltoAllAttnUpdateAllGather {
 using namespace AscendC;
 
 // -- Static knobs --
-constexpr int32_t  FLAG_OFFSET           = 100 * 1024 * 1024;
+// FLAG_OFFSET 旧硬编 100MB 已废弃 -> 动态 flagOffset_ (Rev 5.8, tiling 传, 贴 window 末尾).
 constexpr uint64_t CYCLES_PER_US   = 50ULL;
 constexpr uint64_t SYNC_TIMEOUT_US = 10ULL * 1000ULL * 1000ULL;   // 10s 死锁 fail-fast
 constexpr uint32_t USED_UB_SIZE          = 160 * 1024;        // fused row ping-pong total
@@ -141,6 +141,7 @@ public:
         slotCOffsetInWin_    = tiling->slotCOffsetInWin;     // = cp_size_ · slotABytesPerRank_
         slotCRowsMax_        = tiling->slotCRowsMax;         // = totalT / cp_size_
         maxRowsPerSubtile_   = tiling->maxRowsPerSubtile;
+        flagOffset_          = tiling->flagOffsetBytes;   // 动态 flag 区偏移 (贴 window 末尾)
 
         blockIdx_ = GetBlockIdx();
         // Default launcher → blockIdx_ ∈ [0, aivNum_). SplitCoreCal divides work.
@@ -177,13 +178,13 @@ public:
 
         if (b0_ > 0) {
             // ---- launchCount_ 派生 + counter 更新 (对齐 dispatch_ffn_combine hccl_shmem.hpp) ----
-            // counter @ FLAG_OFFSET (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
+            // counter @ flagOffset_ (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
             // launchCount_ (uint32 单调, 良定义回绕 ~4.3e9 launches, 区分 launch 防 stale flag).
             // 各 core 读同一本地 counter, 值一致; 读后 SyncAll 保证都读完, 再 core0 写 counter=
             // launchCount_ 供下一 launch (读写分离防竞争). gm_dcci: 读前 invalid 清陈旧 dcache,
             // 写后 clean 刷 GM 使下一 launch 可见.
             // 仅 dycp 请求(b0>0)更新 counter: 此时 16 卡同步 +1, counter 跨 rank 一致.
-            __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + FLAG_OFFSET);
+            __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + flagOffset_);
             gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
             launchCount_ = static_cast<uint32_t>(gm_load(counter)) + 1u;
             SyncAll<true>();   // 所有 core 读完 counter, launchCount_ 就绪
@@ -200,11 +201,6 @@ public:
             SyncAll<true>();
             SyncAll<true>();
         }
-        if (blockIdx_ == 0) {
-            AscendC::printf("[ATU_DBG] INIT rank=%u launchCount=%u b0=%u attnIn=%llu attnOut=%llu\n",
-                            rankId_, launchCount_, b0_,
-                            (uint64_t)attnInGm_, (uint64_t)attnOutGm_);
-        }
     }
 
     __aicore__ inline void Process()
@@ -215,12 +211,10 @@ public:
         SplitCoreCalForToken();
 
         if (b0_ == 0) {
-            if (blockIdx_ == 0) {
-                AscendC::printf("[ATU_DBG] PASS_THROUGH rank=%u b0=0 (stale mask_num?)\n", rankId_);
-            }
-            // No active token: inplace pass-through (attn_out==attn_in, inactive rows 不搬).
-            // 但仍需 3 stage CrossRankSyncV1 (防御性: 防 mask_num 跨 rank 不一致时 b0_>0 rank
-            // 等 b0_==0 rank flag 死锁). b0_==0 时 Phase A/B/C for 循环空, sync 无 data 依赖.
+            // b0_==0 = DP 请求: 另 15 卡 idle 不调算子, pass-through 不需跨 rank.
+            // (旧版调 CrossRankSyncV1 等 15 卡 flag -> 10s 超时 assert; 2026-07-15 改纯 SyncAll).
+            // inplace pass-through(attn_out==attn_in, inactive rows 不搬), 只需同 rank 内 core 同步.
+            // 6x SyncAll + PipeBarrier 让 idle core 跨同样 barrier 后 return.
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
             SyncAll<true>(); SyncAll<true>();
@@ -762,7 +756,7 @@ private:
     //  launchCount_ 单调计数器替代固定 flagVal=1 -> 区分 launch, 防 reader 读到上 launch 残留 flag
     //  误判就绪 -> 读 stale data ("输出像前次 launch" 根因).
     //
-    //  flag 区布局 (每 rank window @ FLAG_OFFSET): counter @ +0 (1 int32); stage s sync 区 @
+    //  flag 区布局 (每 rank window @ flagOffset_): counter @ +0 (1 int32); stage s sync 区 @
     //  +64+s*cp_size_*64, 每 rank slot 16 int32 (64B cacheline 对齐, 各 slot 独立 cacheline 防串扰).
     //  core 分摊: for i=blockIdx_; i<cp_size_; i+=aivNum_ (aivNum_>=cp_size_ 由 tiling 保证,
     //  每 core 至多 1 peer; 多余 core 空操作, 外部 SyncAll 对齐).
@@ -770,7 +764,7 @@ private:
     // ====================================================================
     __aicore__ inline void CrossRankSyncV1(int32_t stage) {
         int32_t count = static_cast<int32_t>(launchCount_);
-        uint64_t stageBase = (uint64_t)FLAG_OFFSET + 64ULL
+        uint64_t stageBase = flagOffset_ + 64ULL
             + (uint64_t)stage * (uint64_t)cp_size_ * 64ULL;
         for (uint32_t i = blockIdx_; i < cp_size_; i += aivNum_) {
             // 1. 写 peer i window[rankId_ slot, stage] = count (跨 chip peermem 写)
@@ -811,17 +805,6 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
         b0_raw_ = (uint32_t)ub.GetValue(0);
-        if (blockIdx_ == 0) {
-            AscendC::printf("[ATU_DBG] READ_MASK rank=%u b0_raw=%u maskGm=%llu\n",
-                            rankId_, b0_raw_, (uint64_t)maskNumGm_);
-            // 验证 #3: graph replay 是否把当前 attn/lse 送到 capture 地址.
-            // pass-through(b0=0)不写 attn, 输出=读到的 attn. 若 replay 读 stale(capture dummy)
-            // -> 输出错. 对比 capture pass vs replay 的 attnIn[0]/lse[0]: 不变=stale(#3), 变=已copy.
-            uint16_t attnBits = gm_load<uint16_t>(reinterpret_cast<__gm__ uint16_t*>(attnInGm_));
-            float lse0 = gm_load<float>(lseInGm_);
-            AscendC::printf("[ATU_DBG] ATTN_LSE rank=%u attnIn[0]=0x%04x lse[0]=%.6f\n",
-                            rankId_, (uint32_t)attnBits, lse0);
-        }
     }
 
     __aicore__ inline void ComputeTileParams() {
@@ -895,6 +878,7 @@ private:
 
     // ---- cross-rank sync ----
     uint32_t launchCount_     = 0;
+    uint64_t flagOffset_      = 0;   // 动态 flag 区偏移 (tiling 传, 贴 window 末尾)
 };
 
 }  // namespace AlltoAllAttnUpdateAllGather

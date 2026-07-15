@@ -175,21 +175,31 @@ public:
 
         ComputeTileParams();
 
-        // ---- launchCount_ 派生 + counter 更新 (对齐 dispatch_ffn_combine hccl_shmem.hpp) ----
-        // counter @ FLAG_OFFSET (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
-        // launchCount_ (uint32 单调, 良定义回绕 ~4.3e9 launches, 区分 launch 防 stale flag).
-        // 各 core 读同一本地 counter, 值一致; 读后 SyncAll 保证都读完, 再 core0 写 counter=
-        // launchCount_ 供下一 launch (读写分离防竞争). gm_dcci: 读前 invalid 清陈旧 dcache,
-        // 写后 clean 刷 GM 使下一 launch 可见.
-        __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + FLAG_OFFSET);
-        gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
-        launchCount_ = static_cast<uint32_t>(gm_load(counter)) + 1u;
-        SyncAll<true>();   // 所有 core 读完 counter, launchCount_ 就绪
-        if (blockIdx_ == 0) {
-            gm_store(counter, static_cast<int32_t>(launchCount_));
+        if (b0_ > 0) {
+            // ---- launchCount_ 派生 + counter 更新 (对齐 dispatch_ffn_combine hccl_shmem.hpp) ----
+            // counter @ FLAG_OFFSET (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
+            // launchCount_ (uint32 单调, 良定义回绕 ~4.3e9 launches, 区分 launch 防 stale flag).
+            // 各 core 读同一本地 counter, 值一致; 读后 SyncAll 保证都读完, 再 core0 写 counter=
+            // launchCount_ 供下一 launch (读写分离防竞争). gm_dcci: 读前 invalid 清陈旧 dcache,
+            // 写后 clean 刷 GM 使下一 launch 可见.
+            // 仅 dycp 请求(b0>0)更新 counter: 此时 16 卡同步 +1, counter 跨 rank 一致.
+            __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + FLAG_OFFSET);
             gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
+            launchCount_ = static_cast<uint32_t>(gm_load(counter)) + 1u;
+            SyncAll<true>();   // 所有 core 读完 counter, launchCount_ 就绪
+            if (blockIdx_ == 0) {
+                gm_store(counter, static_cast<int32_t>(launchCount_));
+                gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
+            }
+            SyncAll<true>();   // core0 counter 写完才进 Process
+        } else {
+            // b0_==0 (DP 请求, 另 15 卡空闲不调算子): 不更新 counter.
+            // counter 跨 rank 靠"所有 rank 调算子次数相同"保持一致; DP 请求只有本卡调,
+            // 若 +1 会导致下次 dycp 请求 launchCount_ 跨 rank 不匹配 -> CrossRankSyncV1 死锁.
+            // 2x SyncAll 与 b0>0 分支对齐, 保持同 rank 内 core 同步.
+            SyncAll<true>();
+            SyncAll<true>();
         }
-        SyncAll<true>();   // core0 counter 写完才进 Process
         if (blockIdx_ == 0) {
             AscendC::printf("[ATU_DBG] INIT rank=%u launchCount=%u b0=%u attnIn=%llu attnOut=%llu\n",
                             rankId_, launchCount_, b0_,
@@ -213,11 +223,8 @@ public:
             // 等 b0_==0 rank flag 死锁). b0_==0 时 Phase A/B/C for 循环空, sync 无 data 依赖.
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
-            CrossRankSyncV1(0);
             SyncAll<true>(); SyncAll<true>();
-            CrossRankSyncV1(1);
             SyncAll<true>(); SyncAll<true>();
-            CrossRankSyncV1(2);
             SyncAll<true>();
             return;
         }

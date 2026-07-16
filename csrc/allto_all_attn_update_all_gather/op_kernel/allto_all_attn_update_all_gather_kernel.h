@@ -41,10 +41,9 @@ namespace AlltoAllAttnUpdateAllGather {
 using namespace AscendC;
 
 // -- Static knobs --
-// Flag 区固定偏移 100MB. 回退 Rev 5.8 动态化: 7e660b20 用 env 估算 flagOffsetBytes 致
-// mixed batch 报错, 二分法第一步恢复 eaff61aa 硬编 100MB. 100MB 宽松 (只需 winSize>100MB);
-// tiling 双 check 保证 data<=100MB 且 flag 区在 window 内. 各 rank 一致.
-constexpr int32_t  FLAG_OFFSET           = 100 * 1024 * 1024;
+// Flag 区偏移用真实 winContext_->winSize 贴 window 末尾 (对齐 dispatch_ffn_combine
+// hccl_shmem.hpp L97/L167, 生产用真实 winSize 而非 env 估算). 修复 7e660b20 用 env 致
+// mixed batch 越界 (env != 真实 winSize). winSize=0 (静态图) fallback tiling env flagOffsetBytes.
 constexpr uint64_t CYCLES_PER_US   = 50ULL;
 constexpr uint64_t SYNC_TIMEOUT_US = 10ULL * 1000ULL * 1000ULL;   // 10s 死锁 fail-fast
 constexpr uint32_t USED_UB_SIZE          = 160 * 1024;        // fused row ping-pong total
@@ -168,6 +167,19 @@ public:
             }
         }
 
+        // Flag 区偏移: 用真实 winContext_->winSize 贴 window 末尾 (对齐 dispatch_ffn_combine
+        // hccl_shmem.hpp L97/L167, 生产用真实 winSize 而非 env 估算). 7e660b20 用 env
+        // (GetMaxWindowSize 读 HCCL_BUFFSIZE) 致 mixed batch 越界: env 是配置上限, winSize 是
+        // HCCL 运行时实际分配 (moe_distribute_base.h L146: 静态图可能 0, 动态图非 0), 二者可能不等.
+        // winSize=0 (静态图, window 未分配) fallback tiling env flagOffsetBytes (host check 保证).
+        uint64_t realWinSize = winContext_->winSize;
+        uint64_t flagRegion = 64ULL + (uint64_t)cp_size_ * 192ULL;  // counter(64) + 3 stage * cp * 64
+        if (realWinSize > flagRegion) {
+            flagOffset_ = realWinSize - flagRegion;  // 贴真实 window 末尾
+        } else {
+            flagOffset_ = tiling->flagOffsetBytes;   // winSize=0 fallback: env 估算
+        }
+
         // UB buffers: copyBuf_ for Pack/Unpack/Reduce ping-pong; flagBuf_ for mask_num + sync flags.
         Ppipe->InitBuffer(copyBuf_, USED_UB_SIZE);
         Ppipe->InitBuffer(flagBuf_, 64);
@@ -180,13 +192,13 @@ public:
 
         if (b0_ > 0) {
             // ---- launchCount_ 派生 + counter 更新 (对齐 dispatch_ffn_combine hccl_shmem.hpp) ----
-            // counter @ FLAG_OFFSET (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
+            // counter @ flagOffset_ (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
             // launchCount_ (uint32 单调, 良定义回绕 ~4.3e9 launches, 区分 launch 防 stale flag).
             // 各 core 读同一本地 counter, 值一致; 读后 SyncAll 保证都读完, 再 core0 写 counter=
             // launchCount_ 供下一 launch (读写分离防竞争). gm_dcci: 读前 invalid 清陈旧 dcache,
             // 写后 clean 刷 GM 使下一 launch 可见.
             // 仅 dycp 请求(b0>0)更新 counter: 此时 16 卡同步 +1, counter 跨 rank 一致.
-            __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + FLAG_OFFSET);
+            __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t*>(buff_[rankId_] + flagOffset_);
             gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
             launchCount_ = static_cast<uint32_t>(gm_load(counter)) + 1u;
             SyncAll<true>();   // 所有 core 读完 counter, launchCount_ 就绪
@@ -758,7 +770,7 @@ private:
     //  launchCount_ 单调计数器替代固定 flagVal=1 -> 区分 launch, 防 reader 读到上 launch 残留 flag
     //  误判就绪 -> 读 stale data ("输出像前次 launch" 根因).
     //
-    //  flag 区布局 (每 rank window @ FLAG_OFFSET): counter @ +0 (1 int32); stage s sync 区 @
+    //  flag 区布局 (每 rank window @ flagOffset_): counter @ +0 (1 int32); stage s sync 区 @
     //  +64+s*cp_size_*64, 每 rank slot 16 int32 (64B cacheline 对齐, 各 slot 独立 cacheline 防串扰).
     //  core 分摊: for i=blockIdx_; i<cp_size_; i+=aivNum_ (aivNum_>=cp_size_ 由 tiling 保证,
     //  每 core 至多 1 peer; 多余 core 空操作, 外部 SyncAll 对齐).
@@ -766,7 +778,7 @@ private:
     // ====================================================================
     __aicore__ inline void CrossRankSyncV1(int32_t stage) {
         int32_t count = static_cast<int32_t>(launchCount_);
-        uint64_t stageBase = (uint64_t)FLAG_OFFSET + 64ULL
+        uint64_t stageBase = flagOffset_ + 64ULL
             + (uint64_t)stage * (uint64_t)cp_size_ * 64ULL;
         for (uint32_t i = blockIdx_; i < cp_size_; i += aivNum_) {
             // 1. 写 peer i window[rankId_ slot, stage] = count (跨 chip peermem 写)
@@ -880,6 +892,7 @@ private:
 
     // ---- cross-rank sync ----
     uint32_t launchCount_     = 0;
+    uint64_t flagOffset_      = 0;   // 动态 flag 区偏移 (tiling 传, 贴 window 末尾)
 };
 
 }  // namespace AlltoAllAttnUpdateAllGather

@@ -155,32 +155,8 @@ public:
         maskNumGm_  = reinterpret_cast<__gm__ int32_t*>(maskNum);
         attnOutGm_  = reinterpret_cast<__gm__ bfloat16_t*>(attnOut);   // == attnInGm_
 
-        // Peermem window addresses — populated for all peers (cp_size_ ≤ 32 → buff_[32] enough).
-        winContext_ = (__gm__ HcclOpResParam *)contextGM;
-        rankId_     = winContext_->localUsrRankId;
-        for (uint32_t i = 0; i < cp_size_; i++) {
-            if (i == rankId_) {
-                buff_[i] = (GM_ADDR)winContext_->localWindowsIn;
-            } else {
-                auto* remote = (HcclRankRelationResV2*)(winContext_->remoteRes[i].nextDevicePtr);
-                buff_[i] = (GM_ADDR)(remote->windowsIn);
-            }
-        }
-
-        // Flag 区偏移: 用真实 winContext_->winSize 贴 window 末尾 (对齐 dispatch_ffn_combine
-        // hccl_shmem.hpp L97/L167, 生产用真实 winSize 而非 env 估算). 7e660b20 用 env
-        // (GetMaxWindowSize 读 HCCL_BUFFSIZE) 致 mixed batch 越界: env 是配置上限, winSize 是
-        // HCCL 运行时实际分配 (moe_distribute_base.h L146: 静态图可能 0, 动态图非 0), 二者可能不等.
-        // winSize=0 (静态图, window 未分配) fallback tiling env flagOffsetBytes (host check 保证).
-        uint64_t realWinSize = winContext_->winSize;
-        uint64_t flagRegion = 64ULL + (uint64_t)cp_size_ * 192ULL;  // counter(64) + 3 stage * cp * 64
-        if (realWinSize > flagRegion) {
-            flagOffset_ = realWinSize - flagRegion;  // 贴真实 window 末尾
-        } else {
-            flagOffset_ = tiling->flagOffsetBytes;   // winSize=0 fallback: env 估算
-        }
-
         // UB buffers: copyBuf_ for Pack/Unpack/Reduce ping-pong; flagBuf_ for mask_num + sync flags.
+        // flagBuf_ 须先 Init: ReadMaskNum 依赖它 (b0==0 也需读 mask_num 判 DP).
         Ppipe->InitBuffer(copyBuf_, USED_UB_SIZE);
         Ppipe->InitBuffer(flagBuf_, 64);
 
@@ -191,6 +167,33 @@ public:
         ComputeTileParams();
 
         if (b0_ > 0) {
+            // Peermem window + flagOffset_ 仅 dycp(b0>0)需要; DP(b0==0)访问 winContext_ 会触发
+            // MC2 peermem 懒初始化, 故从 Init 前置移入此分支.
+            // Peermem window addresses - populated for all peers (cp_size_ ≤ 32 -> buff_[32] enough).
+            winContext_ = (__gm__ HcclOpResParam *)contextGM;
+            rankId_     = winContext_->localUsrRankId;
+            for (uint32_t i = 0; i < cp_size_; i++) {
+                if (i == rankId_) {
+                    buff_[i] = (GM_ADDR)winContext_->localWindowsIn;
+                } else {
+                    auto* remote = (HcclRankRelationResV2*)(winContext_->remoteRes[i].nextDevicePtr);
+                    buff_[i] = (GM_ADDR)(remote->windowsIn);
+                }
+            }
+
+            // Flag 区偏移: 用真实 winContext_->winSize 贴 window 末尾 (对齐 dispatch_ffn_combine
+            // hccl_shmem.hpp L97/L167, 生产用真实 winSize 而非 env 估算). 7e660b20 用 env
+            // (GetMaxWindowSize 读 HCCL_BUFFSIZE) 致 mixed batch 越界: env 是配置上限, winSize 是
+            // HCCL 运行时实际分配 (moe_distribute_base.h L146: 静态图可能 0, 动态图非 0), 二者可能不等.
+            // winSize=0 (静态图, window 未分配) fallback tiling env flagOffsetBytes (host check 保证).
+            uint64_t realWinSize = winContext_->winSize;
+            uint64_t flagRegion = 64ULL + (uint64_t)cp_size_ * 192ULL;  // counter(64) + 3 stage * cp * 64
+            if (realWinSize > flagRegion) {
+                flagOffset_ = realWinSize - flagRegion;  // 贴真实 window 末尾
+            } else {
+                flagOffset_ = tiling->flagOffsetBytes;   // winSize=0 fallback: env 估算
+            }
+
             // ---- launchCount_ 派生 + counter 更新 (对齐 dispatch_ffn_combine hccl_shmem.hpp) ----
             // counter @ flagOffset_ (每 rank 本地 window, 各 rank 独立). 读 counter+1 得本 launch
             // launchCount_ (uint32 单调, 良定义回绕 ~4.3e9 launches, 区分 launch 防 stale flag).
@@ -207,14 +210,9 @@ public:
                 gm_dcci(reinterpret_cast<__gm__ uint8_t*>(counter));
             }
             SyncAll<true>();   // core0 counter 写完才进 Process
-        } else {
-            // b0_==0 (DP 请求, 另 15 卡空闲不调算子): 不更新 counter.
-            // counter 跨 rank 靠"所有 rank 调算子次数相同"保持一致; DP 请求只有本卡调,
-            // 若 +1 会导致下次 dycp 请求 launchCount_ 跨 rank 不匹配 -> CrossRankSyncV1 死锁.
-            // 2x SyncAll 与 b0>0 分支对齐, 保持同 rank 内 core 同步.
-            SyncAll<true>();
-            SyncAll<true>();
         }
+        // b0_==0 (DP 请求): inplace pass-through(attn_out==attn_in), 无通信无 SyncAll, 直接结束.
+        // counter 不更新: DP +1 会致下次 dycp launchCount_ 跨 rank 不匹配 -> CrossRankSyncV1 死锁.
     }
 
     __aicore__ inline void Process()
@@ -225,15 +223,7 @@ public:
         SplitCoreCalForToken();
 
         if (b0_ == 0) {
-            // b0_==0 = DP 请求: 另 15 卡 idle 不调算子, pass-through 不需跨 rank.
-            // (旧版调 CrossRankSyncV1 等 15 卡 flag -> 10s 超时 assert; 2026-07-15 改纯 SyncAll).
-            // inplace pass-through(attn_out==attn_in, inactive rows 不搬), 只需同 rank 内 core 同步.
-            // 6x SyncAll + PipeBarrier 让 idle core 跨同样 barrier 后 return.
-            PipeBarrier<PIPE_ALL>();
-            SyncAll<true>();
-            SyncAll<true>(); SyncAll<true>();
-            SyncAll<true>(); SyncAll<true>();
-            SyncAll<true>();
+            // b0_==0 (DP 请求): inplace pass-through, 直接 return, 无 SyncAll.
             return;
         }
 
